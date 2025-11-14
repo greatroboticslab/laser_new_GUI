@@ -2,7 +2,9 @@
 """
 Enhanced UMD2 backend: serial/file -> tokens -> computations -> JSONL/CSV
 
-Adds --raw-log <path> to write raw (pre-parse) serial lines when using --serial.
+Adds:
+  - --print-parsed : print post-calculation records to STDERR for quick verification
+  - Fallback parser for 8-number raw lines (optionally prefixed with "[RAW]")
 """
 
 import sys
@@ -15,8 +17,19 @@ import math
 from collections import deque
 from typing import Optional, List
 
+# Header like: "Sample Frequency = 1000 Hz"
 HeaderFS_RE = re.compile(r'^\s*Sample\s+Frequency\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*Hz\s*$', re.IGNORECASE)
+
+# Token format like: "D: 123 N: 456 X: 0.1"
 Tok_RE = re.compile(r'([A-Za-z]+)\s*:\s*(-?\d+(?:\.\d+)?)\b')
+
+# Fallback for your 8-number raw lines, optionally starting with "[RAW] "
+# Example line:
+#   [RAW] 1645 1645 179791254 0 0 1318946 0 0
+RAW8_RE = re.compile(
+    r'^\s*(?:\[RAW\]\s*)?'
+    r'(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s*$'
+)
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="UMD2 parser & calculator (enhanced)")
@@ -70,8 +83,12 @@ def parse_args(argv=None):
     p.add_argument("--out", choices=["jsonl","csv"], default="jsonl")
     p.add_argument("--log", type=str, default=None, help="Append processed CSV to this path.")
 
-    # NEW: raw serial sidecar log (USB only)
+    # Raw serial sidecar log (USB only)
     p.add_argument("--raw-log", type=str, default=None, help="Write raw pre-parse serial lines to this path (serial mode only).")
+
+    # NEW: print post-calculation record to STDERR for verification
+    p.add_argument("--print-parsed", action="store_true",
+                   help="Print post-calculation record to STDERR")
 
     return p.parse_args(argv)
 
@@ -92,10 +109,13 @@ def iter_lines_serial(port: str, baud: int):
                     line, buf = buf.split(b"\n", 1)
                     yield line.decode(errors="ignore")
             else:
+                # keep looping; timeout gives us a chance to flush
                 pass
     finally:
-        try: ser.close()
-        except: pass
+        try:
+            ser.close()
+        except:
+            pass
 
 def iter_lines_file(path: str):
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -133,7 +153,7 @@ def compute_step_nm(args) -> float:
     if args.stepnm is not None:
         return float(args.stepnm)
     div = max(1, int(args.scale_div))
-    return float(args.lambda_nm) / div
+    return float(args.lambda_nm) / div  # argparse converts --lambda-nm -> lambda_nm
 
 def apply_env(x_nm: float, args) -> float:
     scale = 1.0
@@ -193,7 +213,7 @@ def main(argv=None):
         stdout_writer.writerow(["seq","fs_hz","D","deltaD","step_nm","x_nm","v_nm_s",
                                 "x_nm_ema","x_nm_ma","x_nm_env","angle_deg","x2","y2"])
 
-    # NEW: raw serial sidecar file (serial mode only)
+    # Raw serial sidecar file (serial mode only)
     raw_log_fh = None
     if args.raw_log and args.serial:
         try:
@@ -216,29 +236,42 @@ def main(argv=None):
         if not line:
             continue
 
+        # Optional header-based fs extract
         fs_found = maybe_extract_fs(line)
         if fs_found:
             fs_hz = fs_found
             continue
 
-        toks = parse_line_tokens(line)
-        # D preference: DIFF > D
-        D = None
-        if "DIFF" in toks:
-            D = int(toks["DIFF"])
-        elif "D" in toks:
-            D = int(toks["D"])
+        # ---------- Parse sample ----------
+        # 1) Fallback: 8-number raw line (your stream)
+        m8 = RAW8_RE.match(line)
+        if m8:
+            a, b, c, d, e, n, x_col, y_col = (int(m8.group(i)) for i in range(1, 9))
+            # Heuristic: second column behaves like D; sixth column looks like seq/N
+            D = int(b)
+            N = int(n)
+            # Only expose X/Y if explicitly enabled; many rows have command/value here
+            x2 = float(x_col) if (args.enable_xy) else None
+            y2 = float(y_col) if (args.enable_xy) else None
         else:
-            continue
+            # 2) Token-based (DIFF/D/N/X/Y)
+            toks = parse_line_tokens(line)
+            if "DIFF" in toks:
+                D = int(toks["DIFF"])
+            elif "D" in toks:
+                D = int(toks["D"])
+            else:
+                # Not a data line we can use
+                continue
+            N = int(toks.get("N", 0))
+            x2 = float(toks["X"]) if ("X" in toks and args.enable_xy) else None
+            y2 = float(toks["Y"]) if ("Y" in toks and args.enable_xy) else None
 
-        N = int(toks.get("N", 0))
-
-        x2 = float(toks["X"]) if ("X" in toks and args.enable_xy) else None
-        y2 = float(toks["Y"]) if ("Y" in toks and args.enable_xy) else None
-
+        # Defaults
         if fs_hz <= 0.0:
-            fs_hz = 1000.0
+            fs_hz = 1000.0  # sane default if not provided by header/CLI
 
+        # deltaD
         if prevD is None:
             dD = 0
             prevD = D
@@ -246,10 +279,12 @@ def main(argv=None):
             dD = D - prevD
             prevD = D
 
-        dx = step_nm_per_count * float(dD)
+        # Kinematics
+        dx = step_nm_per_count * float(dD)   # nm moved this sample
         x_nm = (x_nm + dx) * args.straight_mult
-        v_nm_s = dx * fs_hz
+        v_nm_s = dx * fs_hz                  # nm/s
 
+        # Smoothing
         x_nm_ema = None
         if args.ema_alpha > 0.0:
             if ema_x is None:
@@ -265,12 +300,15 @@ def main(argv=None):
             ma_buf.append(x_nm)
             x_nm_ma = sum(ma_buf) / len(ma_buf)
 
+        # Environmental compensation
         x_nm_env = apply_env(x_nm, args)
 
+        # Angle (optional)
         angle_deg = None
         if args.mode == "angle":
             angle_deg = angle_from_displacement(x_nm, args)
 
+        # Emit policy
         keep = True
         if args.emit == "onstep":
             keep = (dD != 0)
@@ -283,6 +321,7 @@ def main(argv=None):
         if not keep:
             continue
 
+        # Final record (what GUI consumes in JSONL mode)
         rec = {
             "seq": int(N),
             "fs_hz": float(fs_hz),
@@ -299,19 +338,25 @@ def main(argv=None):
             "y2": (float(y2) if y2 is not None else None),
         }
 
+        # Print parsed record for human verification (to STDERR)
+        if args.print_parsed:
+            sys.stderr.write(f"[PARSED] {rec}\n")
+            sys.stderr.flush()
+
+        # Output to STDOUT (GUI reads this)
         if args.out == "jsonl":
             sys.stdout.write(json.dumps(rec, separators=(",",":")) + "\n")
+            sys.stdout.flush()
         else:
+            if stdout_writer is None:
+                stdout_writer = csv.writer(sys.stdout, lineterminator="\n")
+                stdout_writer.writerow(["seq","fs_hz","D","deltaD","step_nm","x_nm","v_nm_s",
+                                        "x_nm_ema","x_nm_ma","x_nm_env","angle_deg","x2","y2"])
             stdout_writer.writerow([rec["seq"], rec["fs_hz"], rec["D"], rec["deltaD"], rec["step_nm"], rec["x_nm"],
                                     rec["v_nm_s"], rec["x_nm_ema"], rec["x_nm_ma"], rec["x_nm_env"],
                                     rec["angle_deg"], rec["x2"], rec["y2"]])
 
-        if log_writer:
-            log_writer.writerow([rec["seq"], rec["fs_hz"], rec["D"], rec["deltaD"], rec["step_nm"], rec["x_nm"],
-                                 rec["v_nm_s"], rec["x_nm_ema"], rec["x_nm_ma"], rec["x_nm_env"],
-                                 rec["angle_deg"], rec["x2"], rec["y2"]])
-
-        # FFT snapshots (optional)
+        # Optional FFT snapshots
         if args.fft_len > 0 and args.fft_every > 0:
             try:
                 import numpy as np
@@ -334,13 +379,20 @@ def main(argv=None):
                         "freq": freq.tolist(),
                         "mag": mag.tolist()
                     }, separators=(",",":")) + "\n")
+                    sys.stdout.flush()
 
     if log_file:
-        try: log_file.flush(); log_file.close()
-        except: pass
+        try:
+            log_file.flush()
+            log_file.close()
+        except:
+            pass
     if raw_log_fh:
-        try: raw_log_fh.flush(); raw_log_fh.close()
-        except: pass
+        try:
+            raw_log_fh.flush()
+            raw_log_fh.close()
+        except:
+            pass
 
 if __name__ == "__main__":
     main()
